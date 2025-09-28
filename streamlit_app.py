@@ -1,4 +1,4 @@
-# app.py  — WSIForge v0.9.1 (patched)
+# app.py — WSIForge v0.9.2 (fixed: no response_format; supports b64_json or url)
 import base64
 import io
 import json
@@ -10,31 +10,22 @@ import requests
 import streamlit as st
 from PIL import Image
 
-# =========================
-# ---- Constants/Config ----
-# =========================
 APP_TITLE = "WSIForge — Web Story Image Forge"
 PORTRAIT = "1024x1792"
 LANDSCAPE = "1792x1024"
 SQUARE = "1024x1024"
 ALLOWED_SIZES = [PORTRAIT, LANDSCAPE, SQUARE]
-DEFAULT_RENDER_SIZE = PORTRAIT  # best fit for 1080x1920 conversion
+DEFAULT_RENDER_SIZE = PORTRAIT
 DEFAULT_WEBP_QUALITY = 82
 MAX_AI_KEYWORDS = 10
 
-# =========================
-# ---- Utilities ----------
-# =========================
 def normalize_size(requested: str) -> str:
     req = (requested or "").lower().replace(" ", "")
     if req in [s.lower() for s in ALLOWED_SIZES]:
         return [s for s in ALLOWED_SIZES if s.lower() == req][0]
-    # heuristics
     try:
         w, h = map(int, req.split("x"))
-        if h >= w:
-            return PORTRAIT
-        return LANDSCAPE
+        return PORTRAIT if h >= w else LANDSCAPE
     except Exception:
         return SQUARE
 
@@ -55,30 +46,36 @@ def to_1080x1920_webp(img: Image.Image, webp_quality: int = DEFAULT_WEBP_QUALITY
 def slugify(s: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in s.strip().lower()).strip("-") or "image"
 
-def b64img(b: bytes) -> str:
-    return "data:image/webp;base64," + base64.b64encode(b).decode("utf-8")
-
-# =========================
-# ---- OpenAI (Images) ----
-# =========================
 @dataclass
 class OpenAIClient:
     api_key: str
     base_url: str = "https://api.openai.com/v1"
 
-    def generate_image(
-        self, prompt: str, size: str, model: str = "gpt-image-1", timeout: int = 60
-    ):
+    def generate_image(self, prompt: str, size: str, model: str = "gpt-image-1", timeout: int = 60):
         url = f"{self.base_url}/images/generations"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        # IMPORTANT: no response_format here. Some accounts reject it.
         payload = {
             "model": model,
             "prompt": prompt.strip(),
             "size": size,
-            "response_format": "b64_json",
-            "quality": "high",
+            "n": 1,
+            "quality": "high",  # optional but allowed
         }
         return requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+def _bytes_from_openai_image_payload(data_item: dict, timeout: int = 60) -> Optional[bytes]:
+    """Return raw image bytes from either b64_json or url."""
+    if "b64_json" in data_item and data_item["b64_json"]:
+        return base64.b64decode(data_item["b64_json"])
+    if "url" in data_item and data_item["url"]:
+        r = requests.get(data_item["url"], timeout=timeout)
+        r.raise_for_status()
+        return r.content
+    return None
 
 def generate_openai_image(
     client: OpenAIClient,
@@ -99,23 +96,21 @@ def generate_openai_image(
                 data = resp.json()
                 if not data.get("data"):
                     return None, "OpenAI returned no image data."
-                b64 = data["data"][0].get("b64_json")
-                if not b64:
-                    return None, "OpenAI returned empty image payload."
-                raw = base64.b64decode(b64)
+                raw = _bytes_from_openai_image_payload(data["data"][0], timeout=timeout_s)
+                if not raw:
+                    return None, "OpenAI returned an empty image payload."
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
                 webp = to_1080x1920_webp(img, webp_quality)
                 return webp, None
 
-            # Non-200
             try:
                 j = resp.json()
             except Exception:
                 j = {"error": {"message": resp.text}}
             last_err = j.get("error", {}).get("message", f"HTTP {resp.status_code}")
             transient = any(x in str(last_err).lower() for x in [
-                "rate limit", "429", "timeout", "timed out",
-                "gateway", "overloaded", "502", "503", "504"
+                "rate limit", "429", "timeout", "timed out", "gateway",
+                "overloaded", "502", "503", "504"
             ])
             if attempt < max_retries and transient:
                 time.sleep(delay); delay *= 1.8; continue
@@ -124,8 +119,8 @@ def generate_openai_image(
         except Exception as e:
             last_err = str(e)
             transient = any(x in last_err.lower() for x in [
-                "rate limit", "429", "timeout", "timed out",
-                "gateway", "overloaded", "502", "503", "504"
+                "rate limit", "429", "timeout", "timed out", "gateway",
+                "overloaded", "502", "503", "504"
             ])
             if attempt < max_retries and transient:
                 time.sleep(delay); delay *= 1.8; continue
@@ -136,9 +131,7 @@ def generate_openai_image(
         hint = " Tip: choose 1024x1792 for portrait Web Stories."
     return None, f"OpenAI image request failed after {max_retries} attempt(s): {last_err}.{hint}"
 
-# =========================
-# ---- Google Places ------
-# =========================
+# ----- Google Places helpers (unchanged logic) -----
 GOOGLE_TEXTSEARCH = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 GOOGLE_DETAILS = "https://maps.googleapis.com/maps/api/place/details/json"
 GOOGLE_PHOTO = "https://maps.googleapis.com/maps/api/place/photo"
@@ -156,7 +149,6 @@ def google_place_photos(api_key: str, place_id: str, timeout: int = 20) -> List[
     return r.json().get("result", {}).get("photos", []) or []
 
 def google_fetch_photo_bytes(api_key: str, photo_ref: str, maxwidth: int = 1600, timeout: int = 60) -> Optional[bytes]:
-    # First request returns a redirect to the actual image URL.
     params = {"photoreference": photo_ref, "maxwidth": maxwidth, "key": api_key}
     r = requests.get(GOOGLE_PHOTO, params=params, timeout=timeout, allow_redirects=False)
     if r.status_code in (301, 302) and "Location" in r.headers:
@@ -164,22 +156,17 @@ def google_fetch_photo_bytes(api_key: str, photo_ref: str, maxwidth: int = 1600,
         img_resp = requests.get(img_url, timeout=timeout)
         img_resp.raise_for_status()
         return img_resp.content
-    # Some environments auto-follow; fallback:
     if r.status_code == 200:
         return r.content
     return None
 
 def get_real_photo_candidates(google_key: str, query: str, max_candidates: int = 6, webp_quality: int = DEFAULT_WEBP_QUALITY) -> List[Tuple[str, bytes]]:
-    """
-    Returns list of (label, webp_bytes) candidates.
-    """
     out = []
     try:
         results = google_text_search(google_key, query)
         if not results:
             return out
-        # Take top results and pull 1 photo from each
-        for res in results[:max_candidates*2]:  # oversample, some places have no photos
+        for res in results[:max_candidates*2]:
             pid = res.get("place_id")
             name = res.get("name") or query
             if not pid:
@@ -205,20 +192,13 @@ def get_real_photo_candidates(google_key: str, query: str, max_candidates: int =
         return out
     return out
 
-# =========================
-# ---- Streamlit UI -------
-# =========================
+# ----- Streamlit UI -----
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption("Create 1080×1920 Web Story images from real photos (Google Places) or via OpenAI. Download everything as a ZIP.")
 
-# Sidebar
 st.sidebar.header("Mode")
-mode = st.sidebar.radio("",
-                        options=["Real Photos", "AI Render"],
-                        index=1 if "render_mode" not in st.session_state else (0 if st.session_state.get("render_mode")=="Real Photos" else 1))
-st.session_state["render_mode"] = mode
-
+mode = st.sidebar.radio("", options=["Real Photos", "AI Render"], index=1)
 st.sidebar.header("Keys")
 g_key = st.sidebar.text_input("Google Maps/Places API key", type="password")
 serp_key = st.sidebar.text_input("SerpAPI key (optional)", type="password")
@@ -227,15 +207,13 @@ openai_key = st.sidebar.text_input("OpenAI API key (for AI Render)", type="passw
 st.sidebar.header("Output")
 webp_quality = st.sidebar.slider("WebP quality", min_value=40, max_value=100, value=DEFAULT_WEBP_QUALITY)
 
-# Main controls
 st.subheader("Input")
 st.write("Paste keywords (one per line)")
 keywords_text = st.text_area("", height=120, placeholder="Vail Village in November\nSkiing in Blue Sky Basin\n...")
 keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
 
 st.write("Render base size (OpenAI). We’ll auto-convert to 1080×1920.")
-size_choice = st.selectbox("", ALLOWED_SIZES, index=ALLOWED_SIZES.index(DEFAULT_RENDER_SIZE),
-                           help="Supported sizes: 1024x1024, 1024x1792 (portrait), 1792x1024 (landscape).")
+size_choice = st.selectbox("", ALLOWED_SIZES, index=0, help="Supported: 1024x1024, 1024x1792, 1792x1024")
 
 colA, colB = st.columns([1,1])
 with colA:
@@ -244,10 +222,8 @@ with colB:
     clear = st.button("Clear")
 
 if clear:
-    st.experimental_set_query_params()  # benign reset
     st.rerun()
 
-# Work area
 st.markdown("---")
 if go:
     if not keywords:
@@ -288,7 +264,7 @@ if go:
                             previews.append((kw, webp_bytes))
                             st.success(f"Done: {fname}")
 
-        else:  # Real Photos
+        else:
             if not g_key:
                 st.error("Google Maps/Places API key is required for Real Photos.")
             else:
@@ -301,7 +277,6 @@ if go:
                             st.warning(msg)
                             continue
 
-                        # Selection UI
                         st.write(f"Select candidates to include for **{kw}**:")
                         chosen = []
                         for label, wb in cands:
@@ -322,7 +297,6 @@ if go:
         zf.close()
         zip_buffer.seek(0)
 
-        # Previews grid
         if previews:
             st.subheader("Previews")
             cols = st.columns(3)
@@ -330,13 +304,11 @@ if go:
                 with cols[idx % 3]:
                     st.image(wb, caption=cap, use_column_width=True)
 
-        # Errors, if any
         if errors:
             st.subheader("Errors")
             for kw, err in errors:
                 st.error(f"{kw}: {err}")
 
-        # Download ZIP
         st.subheader("Download")
         st.download_button(
             label="Download all images as ZIP",
@@ -345,14 +317,12 @@ if go:
             mime="application/zip",
         )
 
-# Helper info
 with st.expander("Tips & Notes", expanded=False):
     st.markdown(
         """
-- **OpenAI sizes allowed**: 1024x1024, 1024x1792 (portrait), 1792x1024 (landscape).  
-  If you choose something else, we normalize under the hood.
-- All outputs are **converted to 1080×1920 WebP** for Web Stories.
-- On transient OpenAI errors (429/5xx/timeouts), we **retry with exponential backoff**.
-- **Real Photos** uses Google Places Text Search → Place Photos. Candidate selection lets you pick which to include.
+- **OpenAI sizes**: 1024x1024, 1024x1792 (portrait), 1792x1024 (landscape).  
+- All outputs become **1080×1920 WebP** (cover + center-crop).
+- Retries for transient 429/5xx/timeouts are built in.
+- Real Photos uses Google Places Text Search → Place Photos.
         """
     )
