@@ -1,4 +1,4 @@
-# app.py — WSIForge v0.9.4
+# app.py — WSIForge v0.9.5
 import base64, io, json, re, time, zipfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -9,7 +9,7 @@ from PIL import Image
 
 APP_TITLE = "WSIForge — Web Story Image Forge"
 
-# Sizes your account supports (from your API error)
+# Sizes your account supports (from prior API response)
 SIZES_SUPPORTED = ["1024x1536", "1536x1024", "1024x1024", "auto"]
 DEFAULT_RENDER_SIZE = "1024x1536"  # portrait
 DEFAULT_WEBP_QUALITY = 82
@@ -204,7 +204,7 @@ def get_real_photo_candidates(google_key: str, query: str, max_candidates: int =
 # ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Create 1080×1920 Web Story images from real photos (Google Places) or via OpenAI. Download everything as a ZIP.")
+st.caption("Create 1080×1920 Web Story images from real photos (Google Places) or via OpenAI. Download individually or as a ZIP.")
 
 st.sidebar.header("Mode")
 mode = st.sidebar.radio("", options=["Real Photos", "AI Render"], index=1)
@@ -230,7 +230,6 @@ st.write("Render base size (OpenAI). We’ll auto-convert to 1080×1920.")
 size_choice = st.selectbox("", SIZES_SUPPORTED, index=SIZES_SUPPORTED.index(DEFAULT_RENDER_SIZE),
                            help="Your account supports: 1024x1536 (portrait), 1536x1024 (landscape), 1024x1024, or auto.")
 
-# ✅ Button label now changes by mode
 button_label = "Select Candidates" if mode == "Real Photos" else "Generate image(s)"
 colA, colB = st.columns([1,1])
 with colA: go = st.button(button_label, type="primary")
@@ -269,7 +268,7 @@ if go:
                         else:
                             fname = f"{slugify(kw)}.webp"
                             zf.writestr(fname, webp_bytes)
-                            previews.append((kw, webp_bytes))
+                            previews.append({"caption": kw, "bytes": webp_bytes, "fname": fname, "mode": "AI"})
                             st.success(f"Done: {fname}")
 
         else:  # Real Photos
@@ -288,37 +287,47 @@ if go:
                         for label, wb in cands:
                             c1, c2 = st.columns([1,3])
                             with c1:
-                                sel = st.checkbox(f"Use: {label}", key=f"{kw}-{label}-{hash(wb)}", value=True)
+                                sel = st.checkbox(f"Use: {label}", key=f"sel-{slugify(kw)}-{hash(wb)}", value=True)
                             with c2:
-                                # 🔧 use_container_width replaces deprecated use_column_width
                                 st.image(wb, caption=label, use_container_width=True)
                             if sel: chosen.append((label, wb))
 
-                        for j, (_, wb) in enumerate(chosen, start=1):
+                        for j, (label, wb) in enumerate(chosen, start=1):
                             fname = f"{slugify(kw)}-{j}.webp"
                             zf.writestr(fname, wb)
-                            previews.append((f"{kw} #{j}", wb))
+                            previews.append({"caption": f"{kw} #{j}", "bytes": wb, "fname": fname, "mode": "REAL"})
                         st.success(f"Added {len(chosen)} image(s) for {kw}.")
 
         zf.close(); zip_buffer.seek(0)
 
+        # === Previews (with per-image download for Real Photos) ===
         if previews:
             st.subheader("Previews")
             cols = st.columns(3)
-            for idx, (cap, wb) in enumerate(previews):
+            for idx, item in enumerate(previews):
                 with cols[idx % 3]:
-                    # 🔧 also updated here
-                    st.image(wb, caption=cap, use_container_width=True)
+                    st.image(item["bytes"], caption=item["caption"], use_container_width=True)
+                    if item["mode"] == "REAL":
+                        st.download_button(
+                            label="Download",
+                            data=item["bytes"],
+                            file_name=item["fname"],
+                            mime="image/webp",
+                            key=f"dl-{idx}-{item['fname']}",
+                        )
 
+        # Errors (if any)
         if errors:
             st.subheader("Errors")
             for kw, err in errors:
                 st.error(f"{kw}: {err}")
 
+        # ZIP download (optional)
         st.subheader("Download")
         st.download_button(
             label="Download all images as ZIP",
             data=zip_buffer.getvalue(),
             file_name="wsiforge_images.zip",
             mime="application/zip",
+            key="zip-all",
         )
