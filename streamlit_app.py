@@ -1,4 +1,4 @@
-# app.py — WSIForge v0.9.3
+# app.py — WSIForge v0.9.4
 import base64, io, json, re, time, zipfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -9,7 +9,7 @@ from PIL import Image
 
 APP_TITLE = "WSIForge — Web Story Image Forge"
 
-# == Sizes your account supports per the API error ==
+# Sizes your account supports (from your API error)
 SIZES_SUPPORTED = ["1024x1536", "1536x1024", "1024x1024", "auto"]
 DEFAULT_RENDER_SIZE = "1024x1536"  # portrait
 DEFAULT_WEBP_QUALITY = 82
@@ -26,10 +26,8 @@ def orientation_of_size(sz: str) -> str:
 
 def normalize_size(requested: str, want: str = "portrait") -> str:
     req = (requested or "").lower().replace(" ", "")
-    # if user picked one of the supported sizes, honor it
     if req in [s.lower() for s in SIZES_SUPPORTED]:
         return [s for s in SIZES_SUPPORTED if s.lower() == req][0]
-    # otherwise map by orientation to a supported size
     return "1024x1536" if want == "portrait" else "1536x1024"
 
 def to_1080x1920_webp(img: Image.Image, webp_quality: int = DEFAULT_WEBP_QUALITY) -> bytes:
@@ -58,7 +56,6 @@ class OpenAIClient:
     def generate_image(self, prompt: str, size: str, model: str, timeout: int = 60):
         url = f"{self.base_url}/images/generations"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        # NOTE: do not send response_format; some accounts reject it.
         payload = {"model": model, "prompt": prompt.strip(), "size": size, "n": 1}
         return requests.post(url, headers=headers, json=payload, timeout=timeout)
 
@@ -72,13 +69,9 @@ def _bytes_from_openai_item(item: dict, timeout: int = 60) -> Optional[bytes]:
     return None
 
 def _parse_supported_sizes(message: str) -> List[str]:
-    # Extract sizes from "Supported values are: '1024x1024', '1024x1536', '1536x1024', and 'auto'."
     m = re.search(r"Supported values are:\s*(.+)", message, flags=re.I)
-    if not m:
-        return []
-    chunk = m.group(1)
-    sizes = re.findall(r"'([\dxauto]+)'", chunk)
-    # keep only sane ones
+    if not m: return []
+    sizes = re.findall(r"'([\dxauto]+)'", m.group(1))
     return [s for s in sizes if s in {"1024x1024","1024x1536","1536x1024","auto"}]
 
 def _ordered_by_orientation(candidates: List[str], want: str) -> List[str]:
@@ -88,11 +81,10 @@ def _ordered_by_orientation(candidates: List[str], want: str) -> List[str]:
         order = ["1536x1024","1024x1024","auto","1024x1536"]
     else:
         order = ["1024x1536","1536x1024","1024x1024","auto"]
-    seen, out = set(), []
+    out, seen = [], set()
     for s in order:
         if s in candidates and s not in seen:
             out.append(s); seen.add(s)
-    # append any remaining unexpected candidates (defensive)
     for s in candidates:
         if s not in seen: out.append(s)
     return out
@@ -108,9 +100,7 @@ def generate_openai_image(
 ) -> Tuple[Optional[bytes], Optional[str]]:
     want = orientation_of_size(requested_size)
     size_primary = normalize_size(requested_size, want)
-    # start with our default candidate list
     candidate_sizes = _ordered_by_orientation(SIZES_SUPPORTED, want)
-    # ensure the user's choice (normalized) is first
     if size_primary in candidate_sizes:
         candidate_sizes.remove(size_primary)
     candidate_sizes = [size_primary] + candidate_sizes
@@ -119,38 +109,31 @@ def generate_openai_image(
     last_err = None
 
     for attempt in range(1, max_retries + 1):
-        # choose size by attempt index
         try_size = candidate_sizes[min(attempt-1, len(candidate_sizes)-1)]
         try:
             resp = client.generate_image(prompt, size=try_size, model=model, timeout=timeout_s)
             if resp.status_code == 200:
                 data = resp.json()
-                if not data.get("data"):
-                    return None, "OpenAI returned no image data."
+                if not data.get("data"): return None, "OpenAI returned no image data."
                 raw = _bytes_from_openai_item(data["data"][0], timeout=timeout_s)
-                if not raw:
-                    return None, "OpenAI returned an empty image payload."
+                if not raw: return None, "OpenAI returned an empty image payload."
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
                 webp = to_1080x1920_webp(img, webp_quality)
                 return webp, None
 
-            # non-200 — parse message
-            try:
-                j = resp.json()
-            except Exception:
-                j = {"error": {"message": resp.text}}
+            try: j = resp.json()
+            except Exception: j = {"error": {"message": resp.text}}
             last_err = j.get("error", {}).get("message", f"HTTP {resp.status_code}")
 
-            # If size invalid, re-order candidates using sizes provided by API
             if "invalid value" in last_err.lower() and "supported values are" in last_err.lower():
                 api_sizes = _parse_supported_sizes(last_err)
                 if api_sizes:
                     candidate_sizes = _ordered_by_orientation(api_sizes, want)
+
             transient = any(x in last_err.lower() for x in ["rate limit","429","timeout","timed out","gateway","overloaded","502","503","504"])
             if transient:
                 time.sleep(delay); delay *= 1.8
                 continue
-            # otherwise, move to next candidate size if available
             continue
 
         except Exception as e:
@@ -196,30 +179,24 @@ def get_real_photo_candidates(google_key: str, query: str, max_candidates: int =
     out = []
     try:
         results = google_text_search(google_key, query)
-        if not results:
-            return out
+        if not results: return out
         for res in results[:max_candidates*2]:
             pid = res.get("place_id")
             name = res.get("name") or query
-            if not pid:
-                continue
+            if not pid: continue
             photos = google_place_photos(google_key, pid)
-            if not photos:
-                continue
+            if not photos: continue
             pref = photos[0].get("photo_reference")
-            if not pref:
-                continue
+            if not pref: continue
             raw = google_fetch_photo_bytes(google_key, pref)
-            if not raw:
-                continue
+            if not raw: continue
             try:
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
                 webp = to_1080x1920_webp(img, webp_quality)
                 out.append((name, webp))
             except Exception:
                 continue
-            if len(out) >= max_candidates:
-                break
+            if len(out) >= max_candidates: break
     except Exception:
         return out
     return out
@@ -234,7 +211,7 @@ mode = st.sidebar.radio("", options=["Real Photos", "AI Render"], index=1)
 
 st.sidebar.header("Keys")
 g_key = st.sidebar.text_input("Google Maps/Places API key", type="password")
-st.sidebar.text_input("SerpAPI key (optional)", type="password")  # placeholder for future
+st.sidebar.text_input("SerpAPI key (optional)", type="password")  # placeholder
 openai_key = st.sidebar.text_input("OpenAI API key (for AI Render)", type="password")
 
 st.sidebar.header("Output")
@@ -242,20 +219,22 @@ webp_quality = st.sidebar.slider("WebP quality", 40, 100, DEFAULT_WEBP_QUALITY)
 
 with st.expander("Advanced", expanded=False):
     model = st.selectbox("OpenAI image model", ["gpt-image-1", "dall-e-3"], index=0)
-    st.write("Supported sizes reported by API/SDK:", ", ".join(SIZES_SUPPORTED))
+    st.write("Supported sizes:", ", ".join(SIZES_SUPPORTED))
 
 st.subheader("Input")
 st.write("Paste keywords (one per line)")
-keywords_text = st.text_area("", height=120, placeholder="Vail Village in November\nSkiing in Blue Sky Basin\n...")
+keywords_text = st.text_area("", height=120, placeholder="Vail Colorado cozy restaurant in fall\nVail Village in November\n...")
 keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
 
 st.write("Render base size (OpenAI). We’ll auto-convert to 1080×1920.")
 size_choice = st.selectbox("", SIZES_SUPPORTED, index=SIZES_SUPPORTED.index(DEFAULT_RENDER_SIZE),
                            help="Your account supports: 1024x1536 (portrait), 1536x1024 (landscape), 1024x1024, or auto.")
 
+# ✅ Button label now changes by mode
+button_label = "Select Candidates" if mode == "Real Photos" else "Generate image(s)"
 colA, colB = st.columns([1,1])
-with colA: go = st.button("Generate image(s)", type="primary")
-with colB: 
+with colA: go = st.button(button_label, type="primary")
+with colB:
     if st.button("Clear"): st.rerun()
 
 st.markdown("---")
@@ -303,6 +282,7 @@ if go:
                         if not cands:
                             msg = "No Google photo candidates found."
                             errors.append((kw, msg)); st.warning(msg); continue
+
                         st.write(f"Select candidates to include for **{kw}**:")
                         chosen = []
                         for label, wb in cands:
@@ -310,8 +290,10 @@ if go:
                             with c1:
                                 sel = st.checkbox(f"Use: {label}", key=f"{kw}-{label}-{hash(wb)}", value=True)
                             with c2:
-                                st.image(wb, caption=label, use_column_width=True)
+                                # 🔧 use_container_width replaces deprecated use_column_width
+                                st.image(wb, caption=label, use_container_width=True)
                             if sel: chosen.append((label, wb))
+
                         for j, (_, wb) in enumerate(chosen, start=1):
                             fname = f"{slugify(kw)}-{j}.webp"
                             zf.writestr(fname, wb)
@@ -325,7 +307,8 @@ if go:
             cols = st.columns(3)
             for idx, (cap, wb) in enumerate(previews):
                 with cols[idx % 3]:
-                    st.image(wb, caption=cap, use_column_width=True)
+                    # 🔧 also updated here
+                    st.image(wb, caption=cap, use_container_width=True)
 
         if errors:
             st.subheader("Errors")
